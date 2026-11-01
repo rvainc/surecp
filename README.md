@@ -57,11 +57,13 @@ Download the `.deb` from the [latest release](https://github.com/rvainc/surecp/r
 
 ```bash
 v=0.2.0
-curl -LO https://github.com/rvainc/surecp/releases/download/v$v/surecp_${v}_all.deb
-sudo apt install ./surecp_${v}_all.deb
+curl -L -o /tmp/surecp_${v}_all.deb https://github.com/rvainc/surecp/releases/download/v$v/surecp_${v}_all.deb
+sudo apt install /tmp/surecp_${v}_all.deb
 surecp --version
 man surecp
 ```
+
+Download into `/tmp`: `apt` reads the file as the user `_apt`, and that user cannot read your home directory.
 
 `apt` does not update this package automatically yet. To update, install the `.deb` of the new release in the same way.
 
