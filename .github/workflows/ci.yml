@@ -30,3 +30,30 @@ jobs:
 
       - name: Tests that need root (free space)
         run: sudo bats -f "free space" tests/local.bats
+
+  # A tag "vX.Y.Z" creates a GitHub Release, but only after all tests pass
+  release:
+    needs: test
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Check that the tag matches VERSION in the script
+        run: |
+          v=$(sed -n 's/^VERSION=//p' surecp)
+          [ "v$v" = "$GITHUB_REF_NAME" ] || { echo "tag $GITHUB_REF_NAME, but VERSION=$v"; exit 1; }
+
+      - name: Release notes from CHANGELOG.md
+        run: |
+          v=${GITHUB_REF_NAME#v}
+          awk -v v="$v" '/^## /{p = ($2 == v); next} p' CHANGELOG.md > notes.md
+          [ -s notes.md ] || { echo "CHANGELOG.md has no section for $v"; exit 1; }
+          cat notes.md
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" surecp LICENSE --title "surecp $GITHUB_REF_NAME" --notes-file notes.md --verify-tag
