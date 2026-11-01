@@ -1,0 +1,32 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends bats shellcheck rsync openssh-server openssh-client xxhash
+          sudo apt-get install -y --no-install-recommends b3sum || echo "b3sum not available: its tests are skipped"
+          sudo mkdir -p /run/sshd   # sshd refuses to start without its privilege separation directory
+
+      - name: ShellCheck
+        run: |
+          shellcheck -S warning -e SC2088,SC2154,SC2155 surecp
+          shellcheck -S warning tests/*.bats tests/helpers.bash
+
+      - name: Tests (normal user)
+        run: bats tests/
+
+      - name: Tests that need root (free space)
+        run: sudo bats -f "free space" tests/local.bats

@@ -1,0 +1,31 @@
+# Local agent notes and settings (not part of the published project)
+CLAUDE.md
+.claude/
+
+# Local dev environment (Docker / Dev Container)
+.devcontainer/
+Dockerfile
+.dockerignore
+docker-compose*.yml
+docker-compose*.yaml
+compose*.yml
+compose*.yaml
+
+# Build output (.deb packages, package staging trees, man pages)
+*.deb
+/build/
+/dist/
+surecp_*_all/
+*.1.gz
+
+# Test lab and temporary files
+/lab/
+*.tmp
+*.log
+
+# Editors and OS
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store

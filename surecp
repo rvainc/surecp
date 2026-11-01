@@ -1,0 +1,249 @@
+#!/usr/bin/env bash
+# surecp — copy a directory with full integrity verification (local or over SSH).
+#   surecp [OPTIONS] SRC DST   SRC/DST: /path | [user@]host:path   (copies the CONTENTS of SRC into DST)
+#   -j, --jobs N             hashing processes on each side (default 1; keep 1 on HDD)
+#   -H, --hash CMD           sha256sum|sha512sum|b3sum|xxh128sum (default sha256sum)
+#   -r, --retries N          retries on network errors, per operation (default 50)
+#   -V, --verify-only        verify only: do not copy and do not write to the target
+#   -y, --yes                answer "yes" to all confirmations (for scripts and cron)
+#       --no-xattrs          do not copy ACLs and xattrs (for file systems without support)
+#       --allow-system-target  allow a system or top-level target (/etc, /usr, /home, /mnt, ~ ...)
+#       --skip-space-check   do not stop when the free space estimate is too small
+#   -h, --help               show this help
+#       --version            show the version
+#   --                       end of options (for paths that start with '-')
+# Before the copy: shows a plan, checks free space and inodes, refuses system targets,
+#   detects an unmounted backup disk and swapped SRC/DST, asks before it replaces files,
+#   and locks the target against a second surecp run.
+# Stages: 1) rsync with resume and automatic retry on network errors
+#         2) metadata: rsync dry-run — nothing is missing and nothing differs
+#            (size, mtime, permissions, owner/group, symlinks, hardlinks, ACLs, xattrs)
+#         3) hashes: evict target files from page cache → hash both sides in parallel → compare
+#         the source manifest is saved to DST/.surecp.sha256 (for future bit rot checks)
+# Safety: reads the source only; never deletes in the target; never overwrites a newer target file;
+#         keeps sparse files sparse; refuses a local target inside the source.
+# Cache eviction is per file (fadvise) and best effort: pages that another process maps can stay cached.
+# Requires: bash, GNU coreutils/findutils, rsync >= 3.1 on both sides; SSH with key auth only.
+# No warranty: use at your own risk. MIT license, see LICENSE.
+set -euo pipefail; export LC_ALL=C
+VERSION=0.1.0
+JOBS=1 HASH=sha256sum RETRIES=50 VERIFY_ONLY=0 XATTRS=1 YES=0 ALLOW_SYS=0 SKIP_SPACE=0
+PD=.surecp-partial MF=.surecp.sha256 LK=.surecp.lock RESERVE=$((1024**3))
+log(){ printf '\e[1;34m[%s]\e[0m %s\n' "$(date +%T)" "$*" >&2; }
+die(){ printf '\e[1;31m%s\e[0m\n' "$*" >&2; exit 1; }
+usage(){ sed -n '2,/^[^#]/{/^#/s/^# \?//p;}' "$0"; }   # print the header comment block
+hum(){ numfmt --to=iec-i --suffix=B "$1"; }
+# --- flag parsing: -x V, --long V, --long=V; unknown flags are an error
+need(){ [[ $# -ge 2 && -n $2 ]] || die "$1: requires a value (see --help)"; }
+args=()
+while (($#)); do
+  case $1 in
+    -j|--jobs)        need "$@"; JOBS=$2;    shift 2;;
+    -H|--hash)        need "$@"; HASH=$2;    shift 2;;
+    -r|--retries)     need "$@"; RETRIES=$2; shift 2;;
+    --jobs=*)         JOBS=${1#*=};    shift;;
+    --hash=*)         HASH=${1#*=};    shift;;
+    --retries=*)      RETRIES=${1#*=}; shift;;
+    -V|--verify-only) VERIFY_ONLY=1; shift;;
+    -y|--yes)         YES=1; shift;;
+    --no-xattrs)      XATTRS=0; shift;;
+    --allow-system-target) ALLOW_SYS=1; shift;;
+    --skip-space-check)    SKIP_SPACE=1; shift;;
+    -h|--help)        usage; exit 0;;
+    --version)        echo "surecp $VERSION"; exit 0;;
+    --)               shift; args+=("$@"); break;;
+    -?*)              die "unknown flag: '$1' (see --help)";;
+    *)                args+=("$1"); shift;;
+  esac
+done
+set -- "${args[@]}"
+[[ $# -eq 2 ]] || { usage >&2; exit 2; }
+# --- validation: these values go into shell commands, so allow a whitelist only
+[[ $JOBS =~ ^[1-9][0-9]?$ ]] || die "--jobs: expected a number 1–99, got '$JOBS'"
+[[ $RETRIES =~ ^[0-9]{1,4}$ ]] || die "--retries: expected a number 0–9999, got '$RETRIES'"
+case $HASH in sha256sum|sha512sum|b3sum|xxh128sum) ;; *) die "--hash: unsupported tool '$HASH'";; esac
+# --- path parsing: guard against option injection into ssh/rsync (host or path starting with '-')
+RX='^([^/:]+):(.*)$'
+norm(){ local -n o=$1; local s=$2 h p   # no $(...): die in a subshell would not stop the script
+  [[ -n $s ]] || die "empty path"
+  if [[ $s =~ $RX ]]; then h=${BASH_REMATCH[1]} p=${BASH_REMATCH[2]}
+    [[ $h == -* || $h =~ [[:space:]] ]] && die "invalid host: '$h'"
+    [[ $p == "~" ]] && p=. ; [[ $p == "~/"* ]] && p=${p#\~/}; [[ -n $p ]] || p=.
+    [[ $p == -* ]] && p=./$p; s=$h:$p
+  else [[ $s == -* ]] && s=./$s; fi
+  o=${s%/}/; }
+norm src "$1"; norm dst "$2"
+[[ $src =~ $RX && $dst =~ $RX ]] && die "rsync cannot copy remote→remote: run the script on one of the machines"
+# --- both local: refuse a target inside the source before any copy (rsync would copy into itself)
+if [[ ! $src =~ $RX && ! $dst =~ $RX ]]; then
+  rs=$(realpath -e -- "$src") || die "source not found: $src"
+  rd=$(realpath -m -- "$dst")
+  [[ $rd != "$rs" ]] || die "source and target are the same directory: $rs"
+  [[ ${rd%/}/ != "${rs%/}"/* ]] || die "target is inside the source: $rd"
+fi
+sq(){ printf "'%s'" "${1//\'/\'\\\'\'}"; }   # POSIX quoting (printf %q emits bash syntax, breaks on sh/zsh)
+SSH=(ssh -o BatchMode=yes -o ConnectTimeout=20 -o ServerAliveInterval=15 -o ServerAliveCountMax=4)
+# run LOC CMD — run CMD via bash with pipefail and $P = path of LOC (locally or on the remote host)
+# CMD must be one line and must not contain '!': csh-family login shells break on both
+run(){ local h='' p=$1 c
+  if [[ $1 =~ $RX ]]; then h=${BASH_REMATCH[1]} p=${BASH_REMATCH[2]}; fi
+  c="set -o pipefail; export LC_ALL=C; P=$(sq "$p"); $2"   # $p keeps its trailing '/': '/' stays '/'
+  if [[ -n $h ]]; then "${SSH[@]}" -- "$h" "bash -c $(sq "$c")"; else bash -c "$c"; fi; }
+at(){ run "$1" "cd -- \"\$P\" && { $2; }"; }   # at LOC CMD — run CMD inside LOC
+# retry CMD... — repeat CMD on network errors (rsync socket/timeout codes, ssh connection failure)
+NET=" 10 12 30 35 255 "
+retry(){ local n=0 rc
+  while :; do "$@" && return 0; rc=$?
+    [[ $NET == *" $rc "* ]] || return $rc
+    ((++n <= RETRIES)) || { log "giving up after $RETRIES retries (rc=$rc)"; return $rc; }
+    log "network error rc=$rc, retry $n/$RETRIES in 10s"; sleep 10
+  done; }
+to(){ local o=$1; shift; "$@" >"$o"; }     # each retry rewrites the output file
+from(){ local i=$1; shift; "$@" <"$i"; }   # each retry rereads the input file
+# confirm TEXT — continue only after the user types "yes" (or --yes); no terminal → stop
+confirm(){ local a
+  ((YES)) && { log "$1 — confirmed by --yes"; return 0; }
+  { exec 3</dev/tty; } 2>/dev/null || die "$1 — there is no terminal for a confirmation: check the plan and rerun with --yes"
+  printf '\e[1;33m%s\e[0m\nType "yes" to continue: ' "$1" >/dev/tty
+  read -r a <&3 || a=; exec 3<&-
+  [[ $a == yes ]] || die "stopped: no confirmation"; }
+
+t=$(mktemp -d) LOCKED=0
+# idempotent: a retry after a lost connection must not fail because the first try already worked
+UNLOCK="if [ -d \"\$P$LK\" ]; then m=\$(stat -c %y -- \"\$P\") && rm -f -- \"\$P$LK/info\" && rmdir -- \"\$P$LK\" && touch -d \"\$m\" -- \"\$P\"; fi"
+# shellcheck disable=SC2046  # word splitting of the job PIDs is intended
+cleanup(){ kill $(jobs -p) 2>/dev/null || true
+  if ((LOCKED)); then RETRIES=$((RETRIES < 5 ? RETRIES : 5)) retry run "$dst" "$UNLOCK" ||
+    printf '\e[1;31mWARNING: could not remove the lock %s — remove it manually\e[0m\n' "${dst}$LK" >&2; fi
+  rm -rf "$t"; }
+trap cleanup EXIT; trap 'exit 130' INT; trap 'exit 143' TERM HUP
+
+# skip partial dirs at any depth, and the manifest and the lock in the root
+PRUNE="\\( -name '$PD' -prune \\) -o \\( -path './$LK' -prune \\) -o -not -path './$MF' -not -path './$MF.tmp'"
+N=8; ((JOBS > 1)) && N=1   # with -P each process writes 1 line in one write() → lines do not interleave
+HASHCMD="find . $PRUNE -type f -print0 | xargs -0r -P$JOBS -n$N $HASH -- | sort"
+# evict target files from page cache: fsync each file, then fadvise(DONTNEED) via dd; failure is fatal
+DROP="find . $PRUNE -type f -print0 | xargs -0r -n64 sh -c 'sync -d -- \"\$@\" && for f; do dd if=\"\$f\" iflag=nocache count=0 status=none || exit 255; done' _"
+RS=(rsync -aHsS --partial-dir="$PD" --timeout=120 -e "${SSH[*]}" --exclude="/$MF" --exclude="/$MF.tmp" --exclude="/$LK")
+((XATTRS)) && RS+=(-AX)
+# statistics: each side only counts raw numbers, formatting happens locally (numfmt is needed only here)
+# %.0f instead of %d: mawk clips %d to 2^31, and a size in bytes is easily larger
+AWK='{n[$1]++} $1=="f"{b+=$2; if($2>m)m=$2} END{printf "%d %d %d %.0f %.0f\n", n["f"], n["d"], n["l"], b, m}'
+STATCMD="find . -mindepth 1 $PRUNE -printf '%y %s\\n' | awk $(sq "$AWK")"
+# stats DIR LABEL VAR — store the raw numbers for DIR in VAR; print them if LABEL is not empty
+stats(){ local -n out=$3; local f d l b
+  retry to "$t/stat" at "$1" "$STATCMD" || die "failed to collect statistics: $1"
+  out=$(<"$t/stat"); read -r f d l b _ <<<"$out"
+  [[ -z $2 ]] || log "$2 ${1%/}: files $f, directories $d, symlinks $l, size $(hum "$b") ($b bytes)"; }
+# source scan: names that rsync or the hash tool cannot handle safely
+PRECMD="find . \\( -name '$PD' -printf 'PD\\n' -prune \\) -o \\( -path './$LK' -printf 'LK\\n' -prune \\) -o \\( -path './$MF' -printf 'MF\\n' \\) -o \\( -name '*[[:cntrl:]]*' -printf 'CTRL\\n' \\) | sort -u"
+# target probe (no cd: the target may not exist yet), NUL-separated:
+#   OK, real path, $HOME, free bytes, free inodes, total inodes, mount point, non-empty (0/1)
+PROBE='d=${P%/}; d=${d:-/}; until [ -d "$d" ]; do if [ -e "$d" ] || [ -L "$d" ]; then printf "NOTDIR\0%s\0" "$d"; exit 0; fi; d=$(dirname -- "$d"); done; set -- $(df -B1 --output=avail,iavail,itotal -- "$d" | tail -n 1); n=0; [ -d "$P" ] && n=$(ls -A -- "$P" | head -c 1 | wc -c); printf "%s\0" OK "$(realpath -m -- "$P")" "$HOME" "$1" "$2" "$3" "$(df --output=target -- "$d" | tail -n 1)" "$n"'
+
+retry to "$t/pre" at "$src" "$PRECMD" || die "failed to scan the source"
+grep -qx PD "$t/pre" && die "source contains a directory named '$PD': rsync never copies it. Rename it first"
+grep -qx LK "$t/pre" && log "NOTE: the source has a $LK in the root (an old surecp lock): surecp does not copy it"
+grep -qx MF "$t/pre" && log "NOTE: the source has its own $MF in the root: surecp does not copy or verify it"
+case $HASH in sha256sum|sha512sum) ;; *) grep -qx CTRL "$t/pre" &&
+  die "source has names with control characters (for example newline): $HASH does not escape them. Use sha256sum or sha512sum";; esac
+stats "$src" "source" st_src
+[[ ${st_src%% *} != 0 ]] || die "source has 0 files — nothing to copy"
+read -r _ _ _ _ src_max <<<"$st_src"
+
+if ((VERIFY_ONLY == 0)); then
+  # --- target checks: system paths, unmounted disk, free space, plan, swapped SRC/DST, overwrites
+  retry to "$t/probe" run "$dst" "$PROBE" || die "failed to inspect the target"
+  mapfile -d '' -t pr <"$t/probe"
+  [[ ${pr[0]:-} != NOTDIR ]] || die "target path goes through a file, not a directory: ${pr[1]}"
+  [[ ${pr[0]:-} == OK && ${#pr[@]} -eq 8 ]] || die "unexpected answer from the target probe"
+  real=${pr[1]} rhome=${pr[2]} avail=${pr[3]} iavail=${pr[4]} itotal=${pr[5]} mnt=${pr[6]} nonempty=${pr[7]}
+  case $real in /|/proc|/proc/*|/sys|/sys/*|/dev|/dev/*|/run)
+    die "refusing the target $real: it is never a valid copy target";; esac
+  sys=
+  case $real in /bin|/bin/*|/sbin|/sbin/*|/lib|/lib/*|/lib32|/lib32/*|/lib64|/lib64/*|/libx32|/libx32/*|\
+    /usr|/usr/*|/etc|/etc/*|/boot|/boot/*|/var/lib|/var/lib/*|/var/log|/var/log/*|/var/spool|/var/spool/*|\
+    /var/mail|/var/mail/*) sys="a system directory. Choose a target outside the system directories";;
+    /var|/opt|/home|/root|/srv|/mnt|/media|/run/media|/tmp) sys="a top-level directory. Copy into a subdirectory (for example $real/backup)";; esac
+  [[ $real != "${rhome%/}" ]] || sys="the home directory of the remote user. Copy into a subdirectory (for example $real/backup)"
+  if [[ -n $sys ]]; then
+    ((ALLOW_SYS)) || die "the target $real is $sys. If this target is really intended, add --allow-system-target"
+    confirm "WARNING: the target $real is ${sys%%.*}"
+  fi
+  if [[ $real == /mnt/* || $real == /media/* || $real == /run/media/* ]] && [[ $mnt == / ]]; then
+    confirm "WARNING: the target $real is on the root file system, not on a separate disk. Is the backup disk mounted?"
+  fi
+  log "planning (rsync dry-run)"
+  retry to "$t/p1" "${RS[@]}" -n -i -u --stats --no-h -- "$src" "$dst" || die "rsync dry-run (plan) failed"
+  retry to "$t/p2" "${RS[@]}" -n -i -- "$src" "$dst" || die "rsync dry-run (plan) failed"
+  # itemize: ">f" = received (local target), "<f" = sent (remote target); "+++" = new file
+  grep -E '^[<>]f[^+]' "$t/p1" | sort >"$t/over" || true
+  grep -E '^[<>]f[^+]' "$t/p2" | sort >"$t/over_all" || true
+  comm -13 "$t/over" "$t/over_all" >"$t/newer"
+  nnew=$(grep -cE '^[<>]f\+' "$t/p1" || true) nover=$(wc -l <"$t/over") nnewer=$(wc -l <"$t/newer")
+  bytes=$(sed -n 's/^Total transferred file size: \([0-9]*\) bytes$/\1/p' "$t/p1")
+  created=$(sed -n 's/^Number of created files: \([0-9]*\).*/\1/p' "$t/p1")
+  [[ $bytes =~ ^[0-9]+$ && $created =~ ^[0-9]+$ ]] || die "failed to read the rsync plan statistics"
+  log "plan: new files $nnew, files to replace $nover, to transfer $(hum "$bytes"); target ${dst%/} on $mnt has $(hum "$avail") free"
+  if ((nnewer)); then sed 's/^[^ ]* /  /' "$t/newer" | head -n 10 >&2; ((nnewer > 10)) && echo "  ... and $((nnewer - 10)) more" >&2
+    die "STOP: $nnewer file(s) in the target are newer than in the source (list above). Did you swap SRC and DST? surecp never replaces newer files. Check these files manually"
+  fi
+  if ((SKIP_SPACE == 0)); then
+    [[ $avail =~ ^[0-9]+$ ]] || die "failed to read the free space of the target. Use --skip-space-check to continue without the check"
+    # temp copy: rsync keeps the old file until the new one is complete, so add the largest file
+    needb=$((bytes + (nover > 0 ? src_max : 0) + RESERVE))
+    ((avail >= needb)) || die "not enough free space on $mnt: need $(hum "$needb") (data$( ((nover)) && echo ' + largest file for the temp copy') + 1GiB reserve), free $(hum "$avail"). Free up space or use --skip-space-check"
+    if [[ $itotal =~ ^[1-9][0-9]*$ && $iavail =~ ^[0-9]+$ ]]; then
+      ((iavail >= created + 1000)) || die "not enough free inodes on $mnt: need $((created + 1000)), free $iavail"
+    fi
+  else log "WARNING: free space check skipped (--skip-space-check)"; fi
+  if ((nover)); then sed 's/^[^ ]* /  /' "$t/over" | head -n 10 >&2; ((nover > 10)) && echo "  ... and $((nover - 10)) more" >&2
+    confirm "$nover older file(s) in the target will be replaced with the source version (list above)"
+  elif [[ $nonempty == 1 ]]; then log "the target is not empty: surecp only adds files, it replaces nothing"; fi
+  # --- lock: one surecp run per target (mkdir is atomic on local and network file systems)
+  INFO="host=$(hostname) pid=$$ user=$(id -un) started=$(date '+%F %T') src=$src"
+  LOCKCMD="mkdir -p -- \"\$P\" && if mkdir -- \"\$P$LK\" 2>/dev/null; then printf '%s\n' $(sq "$INFO") > \"\$P$LK/info\"; elif [ \"\$(cat -- \"\$P$LK/info\" 2>/dev/null)\" = $(sq "$INFO") ]; then :; else cat -- \"\$P$LK/info\" 2>/dev/null; exit 3; fi"
+  # the elif branch: our own lock from a try whose connection dropped after mkdir
+  if retry to "$t/lock" run "$dst" "$LOCKCMD"; then LOCKED=1
+  else rc=$?; ((rc == 3)) || die "failed to lock the target (rc=$rc)"
+    die "the target is locked by another surecp run: $(<"$t/lock"). If no surecp runs now, remove ${dst}$LK"; fi
+
+  log "1/3 copying $src → $dst"
+  # -u: a target file that is newer stays untouched; stage 2 then reports it
+  retry "${RS[@]}" -u --info=progress2,stats1 -- "$src" "$dst" || { rc=$?; case $rc in
+    23) die "rsync rc=23: some files or attributes were not transferred (see the errors above). If they mention ACLs or xattrs, use --no-xattrs";;
+    *)  die "rsync rc=$rc — stopping";; esac; }
+fi
+
+log "2/3 checking metadata (size, mtime, permissions, owner, links$( ((XATTRS)) && echo ', ACLs, xattrs'))"
+retry to "$t/diffs" "${RS[@]}" -n -i -- "$src" "$dst" || die "rsync dry-run failed"
+[[ ! -s $t/diffs ]] || { cat "$t/diffs" >&2
+  die "FAIL: metadata differs ('>' or 'c' = content differs or is missing, '.' = attributes only). surecp never overwrites a newer target file: check such files manually"; }
+
+log "3/3 hashing both sides ($HASH), evicting target files from page cache"
+retry at "$dst" "$DROP" || die "failed to evict target files from page cache — verification would read RAM, not disk"
+retry to "$t/src" at "$src" "$HASHCMD" & p=$!
+retry to "$t/dst" at "$dst" "$HASHCMD" || die "hashing the target failed (unreadable file or $HASH missing)"
+wait $p || die "hashing the source failed (unreadable file or $HASH missing)"
+[[ -s $t/src ]] || die "source has 0 files — nothing to verify"
+bad=$(comm -23 "$t/src" "$t/dst")
+if [[ -n $bad ]]; then echo "$bad" >&2
+  opts="--jobs $JOBS --hash $HASH"; ((XATTRS)) || opts+=" --no-xattrs"
+  fix="rsync -acHS$( ((XATTRS)) && echo AX) -- $(sq "$src") $(sq "$dst")"
+  die "FAIL: $(wc -l <<<"$bad") file(s) differ or are missing in the target (did the source change during the run?). Fix: $fix, then $0 --verify-only $opts $(sq "$1") $(sq "$2")"
+fi
+
+if ((VERIFY_ONLY == 0)); then
+  # restore the root mtime: otherwise every later metadata check reports './' as changed
+  MFCMD="m=\$(stat -c %y .) && cat > $MF.tmp && sync -d $MF.tmp && mv -f $MF.tmp $MF && touch -d \"\$m\" ."
+  retry from "$t/src" at "$dst" "$MFCMD" || die "failed to write the manifest"
+  done_msg="manifest → ${dst}$MF"
+else done_msg="target not modified (--verify-only)"; fi
+stats "$src" "" st_end
+stats "$dst" "target" st_dst
+if [[ $st_end != "$st_src" ]]; then
+  log "WARNING: the source changed during the run: changes after the hash stage are not in the target. Run surecp again"
+elif [[ $st_end != "$st_dst" ]]; then
+  log "WARNING: the target has extra objects that are not in the source (surecp never deletes them)"
+fi
+log "OK: $(wc -l <"$t/src") files identical; $done_msg"
