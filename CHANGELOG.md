@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.0 — 2026-11-01
+
+- Debian package `surecp_<version>_all.deb` with a man page (`packaging/build-deb.sh`). The build is reproducible and `lintian` finds no issues.
+- CI builds, checks, installs and runs the `.deb`. Each release has the `.deb` attached.
+- `--help` uses the GNU layout (`Usage:`, `Options:`) and only ASCII characters.
+
 ## 0.1.0 — 2026-11-01
 
 First public version.

@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
-# surecp — copy a directory with full integrity verification (local or over SSH).
-#   surecp [OPTIONS] SRC DST   SRC/DST: /path | [user@]host:path   (copies the CONTENTS of SRC into DST)
+# surecp - copy a directory with full integrity verification (local or over SSH).
+#
+# Usage: surecp [OPTIONS] SRC DST
+#
+# Copies the CONTENTS of SRC into DST. SRC and DST: /path or [user@]host:path.
+#
+# Options:
 #   -j, --jobs N             hashing processes on each side (default 1; keep 1 on HDD)
 #   -H, --hash CMD           sha256sum|sha512sum|b3sum|xxh128sum (default sha256sum)
 #   -r, --retries N          retries on network errors, per operation (default 50)
@@ -12,21 +17,28 @@
 #   -h, --help               show this help
 #       --version            show the version
 #   --                       end of options (for paths that start with '-')
-# Before the copy: shows a plan, checks free space and inodes, refuses system targets,
-#   detects an unmounted backup disk and swapped SRC/DST, asks before it replaces files,
-#   and locks the target against a second surecp run.
-# Stages: 1) rsync with resume and automatic retry on network errors
-#         2) metadata: rsync dry-run — nothing is missing and nothing differs
-#            (size, mtime, permissions, owner/group, symlinks, hardlinks, ACLs, xattrs)
-#         3) hashes: evict target files from page cache → hash both sides in parallel → compare
-#         the source manifest is saved to DST/.surecp.sha256 (for future bit rot checks)
-# Safety: reads the source only; never deletes in the target; never overwrites a newer target file;
-#         keeps sparse files sparse; refuses a local target inside the source.
-# Cache eviction is per file (fadvise) and best effort: pages that another process maps can stay cached.
+#
+# Before the copy, surecp shows a plan, checks free space and inodes, refuses system
+# targets, detects an unmounted backup disk and swapped SRC/DST, asks before it replaces
+# files, and locks the target against a second surecp run.
+#
+# Stages:
+#   1) copy: rsync with resume and automatic retry on network errors
+#   2) metadata: rsync dry-run; nothing is missing and nothing differs
+#      (size, mtime, permissions, owner/group, symlinks, hardlinks, ACLs, xattrs)
+#   3) hashes: evict target files from page cache, hash both sides in parallel, compare
+# The source manifest is saved to DST/.surecp.sha256 (for future bit rot checks).
+#
+# Safety: reads the source only; never deletes in the target; never overwrites a newer
+# target file; keeps sparse files sparse; refuses a local target inside the source.
+# Cache eviction is per file (fadvise) and best effort: pages that another process maps
+# can stay cached.
+#
 # Requires: bash, GNU coreutils/findutils, rsync >= 3.1 on both sides; SSH with key auth only.
-# No warranty: use at your own risk. MIT license, see LICENSE.
+#
+# No warranty: use at your own risk. MIT license.
 set -euo pipefail; export LC_ALL=C
-VERSION=0.1.0
+VERSION=0.2.0
 JOBS=1 HASH=sha256sum RETRIES=50 VERIFY_ONLY=0 XATTRS=1 YES=0 ALLOW_SYS=0 SKIP_SPACE=0
 PD=.surecp-partial MF=.surecp.sha256 LK=.surecp.lock RESERVE=$((1024**3))
 log(){ printf '\e[1;34m[%s]\e[0m %s\n' "$(date +%T)" "$*" >&2; }

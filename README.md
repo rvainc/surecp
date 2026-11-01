@@ -51,9 +51,24 @@ The script also writes a manifest `.surecp.sha256` into the target. You can use 
 
 ## Installation
 
+### Debian and Ubuntu (.deb)
+
+Download the `.deb` from the [latest release](https://github.com/rvainc/surecp/releases/latest), then install it:
+
 ```bash
-curl -LO https://raw.githubusercontent.com/rvainc/surecp/main/surecp
-# or: git clone https://github.com/rvainc/surecp.git && cd surecp
+v=0.2.0
+curl -LO https://github.com/rvainc/surecp/releases/download/v$v/surecp_${v}_all.deb
+sudo apt install ./surecp_${v}_all.deb
+surecp --version
+man surecp
+```
+
+`apt` does not update this package automatically yet. To update, install the `.deb` of the new release in the same way.
+
+### Any Linux (one file)
+
+```bash
+curl -LO https://github.com/rvainc/surecp/releases/latest/download/surecp
 install -m 755 surecp ~/.local/bin/surecp
 surecp --version
 ```
@@ -163,11 +178,13 @@ Use `surecp` when you want a plain copy of the files that you can read without s
 ```bash
 shellcheck -S warning -e SC2088,SC2154,SC2155 surecp
 bats tests/
+packaging/build-deb.sh          # → build/surecp_<VERSION>_all.deb
+lintian build/*.deb
 ```
 
 `tests/ssh.bats` starts a private `sshd` on `127.0.0.1` with its own keys. It does not change `~/.ssh`. If `sshd` is not installed, these tests are skipped. One test needs root to mount a small `tmpfs`; it is skipped for a normal user.
 
-CI (GitHub Actions) runs ShellCheck and all tests on every push and pull request.
+CI (GitHub Actions) runs ShellCheck and all tests on every push and pull request. It also builds the `.deb`, checks it with `lintian`, installs it and runs it. A tag `vX.Y.Z` creates a GitHub Release with the script and the `.deb`.
 
 ## Disclaimer
 

@@ -23,7 +23,7 @@ jobs:
       - name: ShellCheck
         run: |
           shellcheck -S warning -e SC2088,SC2154,SC2155 surecp
-          shellcheck -S warning tests/*.bats tests/helpers.bash
+          shellcheck -S warning tests/*.bats tests/helpers.bash packaging/build-deb.sh
 
       - name: Tests (normal user)
         run: bats tests/
@@ -31,9 +31,42 @@ jobs:
       - name: Tests that need root (free space)
         run: sudo bats -f "free space" tests/local.bats
 
+  # Build the .deb, check it with lintian, install it, and run the installed program
+  deb:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends help2man lintian dpkg-dev
+
+      - name: Build
+        run: packaging/build-deb.sh
+
+      - name: Lintian
+        run: lintian --fail-on error,warning --display-info build/*.deb
+
+      - name: Install and run
+        run: |
+          sudo apt-get install -y ./build/*.deb
+          v=$(sed -n 's/^VERSION=//p' surecp)
+          [ "$(surecp --version)" = "surecp $v" ]
+          dpkg -L surecp | grep -qx /usr/share/man/man1/surecp.1.gz
+          mkdir -p "$RUNNER_TEMP/src" && echo test > "$RUNNER_TEMP/src/file"
+          surecp "$RUNNER_TEMP/src" "$RUNNER_TEMP/dst"
+          sudo apt-get remove -y surecp
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: deb
+          path: build/*.deb
+          if-no-files-found: error
+
   # A tag "vX.Y.Z" creates a GitHub Release, but only after all tests pass
   release:
-    needs: test
+    needs: [test, deb]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
@@ -41,10 +74,16 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      - uses: actions/download-artifact@v4
+        with:
+          name: deb
+          path: build
+
       - name: Check that the tag matches VERSION in the script
         run: |
           v=$(sed -n 's/^VERSION=//p' surecp)
           [ "v$v" = "$GITHUB_REF_NAME" ] || { echo "tag $GITHUB_REF_NAME, but VERSION=$v"; exit 1; }
+          ls "build/surecp_${v}_all.deb"
 
       - name: Release notes from CHANGELOG.md
         run: |
@@ -56,4 +95,4 @@ jobs:
       - name: Create the release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" surecp LICENSE --title "surecp $GITHUB_REF_NAME" --notes-file notes.md --verify-tag
+        run: gh release create "$GITHUB_REF_NAME" surecp build/*.deb LICENSE --title "surecp $GITHUB_REF_NAME" --notes-file notes.md --verify-tag
